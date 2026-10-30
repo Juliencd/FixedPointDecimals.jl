@@ -12,43 +12,29 @@ else
     end
 end
 
-const DELIM=';';
 const GROUP=',';
 const DECIM='.';
-const OPTIONS_NEAREST = Parsers.Options(groupmark=GROUP, decimal=DECIM, delim=DELIM, quoted=true, rounding=RoundNearest)
-const OPTIONS_TOZERO = Parsers.Options(groupmark=GROUP, decimal=DECIM, delim=DELIM, quoted=true, rounding=RoundToZero)
-const OPTIONS_THROWS = Parsers.Options(groupmark=GROUP, decimal=DECIM, delim=DELIM, quoted=true, rounding=nothing)
+const OPTIONS_NEAREST = (groupmark=GROUP, decimal=DECIM, rounding=RoundNearest)
+const OPTIONS_TOZERO = (groupmark=GROUP, decimal=DECIM, rounding=RoundToZero)
+const OPTIONS_THROWS = (groupmark=GROUP, decimal=DECIM, rounding=RoundThrows)
 function test_decimal_parser(::Type{T}, f, buf::AbstractString; ok=true, inexact=false, expect=nothing, options = OPTIONS_NEAREST) where {T}
-    delim = options.delim.token
-    b = get(codeunits(buf), 1, 0xff)
-    pl = Parsers.PosLen(1, length(buf))
-    conf = FixedPointDecimals.FixedDecimalConf{T}(f)
-    (pos, code, _, val) = Parsers.typeparser(conf, codeunits(buf), 1, length(buf), b, Parsers.SUCCESS, pl, options)
-    (pos_io, code_io, _, val_io) = Parsers.typeparser(conf, IOBuffer(buf), 1, length(buf), b, Parsers.SUCCESS, pl, options)
-    @testctx let _ctx="T=$T, f=$f, input=$(repr(string(buf))), code=$(Parsers.text(code)), len=$(length(buf)), pos=$pos, delim=$(repr(Char(delim))), groupmark=$(repr(options.groupmark)), decimal=$(repr(Char(options.decimal))), mode=$(options.rounding), expect=$(repr(expect))"
-        ends_on_delim = !isempty(buf) && UInt8(last(buf)) == UInt8(delim)
+    bytes = codeunits(buf)
+    groupmark = isnothing(options.groupmark) ? nothing : UInt8(options.groupmark)
+    val, code = FixedPointDecimals._parse_fd(T, f, bytes, 1, length(bytes), UInt8(options.decimal), groupmark, options.rounding)
+    # The same input in the middle of a larger buffer, as e.g. CSV.jl would parse it
+    padded = Vector{UInt8}("xx" * buf * "yy")
+    res = Parsers.tryparse(FixedDecimal{T,f}, padded, 3, length(padded) - 2; options...)
+    @testctx let _ctx="T=$T, f=$f, input=$(repr(string(buf))), code=$code, len=$(length(buf)), groupmark=$(repr(options.groupmark)), decimal=$(repr(options.decimal)), mode=$(options.rounding), expect=$(repr(expect))"
         # We parsed the value (un)successfully as expected
-        @test Parsers.ok(code) == ok
-        @test Parsers.ok(code_io) == ok
+        @test (code == FixedPointDecimals._OK) == ok
         # We marked the value as inexact as expected
-        @test Parsers.inexact(code) == inexact
-        @test Parsers.inexact(code_io) == inexact
-        # We read all valid bytes, i.e. our current `pos` peeks at one past our input, or the delimiter (which is not a part of the number)
-        ok && (@test pos == (length(buf) + (UInt8(last(buf)) != UInt8(delim))))
-        ok && (@test pos_io == (length(buf) + (UInt8(last(buf)) != UInt8(delim))))
-        # We read all valid bytes and which means that we reached EOF (recovery from invalid input is a job for `Parsers.xparse`)
-        ok && (@test Parsers.eof(code) == !ends_on_delim)
-        ok && (@test Parsers.eof(code_io) == !ends_on_delim)
+        @test (code == FixedPointDecimals._INEXACT) == inexact
         isnothing(expect) || (@test val == expect)
-        isnothing(expect) || (@test val_io == expect)
-        res = Parsers.xparse(FixedDecimal{T,f}, buf, 1, length(buf), options)
-        # Even if the input was not valid, we read it entirely and reached EOF or delim
-        @test Parsers.eof(res.code) == !ends_on_delim
-        @test Parsers.ok(res.code) == ok
         if ok
-            @test res.val.i == expect # The integer from our typeparser matches the integer from our FixedDecimal
+            @test res isa FixedDecimal{T,f}
+            isnothing(expect) || (@test res.i == expect) # The integer from our parser matches the integer from our FixedDecimal
         else
-            @test Parsers.invalid(res.code) # We parsed the value (un)successfully as expected
+            @test isnothing(res)
         end
     end
     return nothing
@@ -60,72 +46,9 @@ const SignedIntegerTypes = (Int8, Int16, Int32, Int64, Int128)
 const UnsignedIntegerTypes = (UInt8, UInt16, UInt32, UInt64, UInt128)
 const IntegerTypes = (SignedIntegerTypes..., UnsignedIntegerTypes...)
 
-@testset "_check_overflows" begin
-    @testset "$T" for T in SignedIntegerTypes
-        @testset "$V" for V in (UInt64, UInt128, BigInt)
-            @test !FixedPointDecimals._check_overflows(T, V(0), true)
-            @test !FixedPointDecimals._check_overflows(T, V(0), false)
-
-            @test !FixedPointDecimals._check_overflows(T, V(1), true)
-            @test !FixedPointDecimals._check_overflows(T, V(1), false)
-
-            if V === BigInt || typemax(T) == typemax(V)
-                @test !FixedPointDecimals._check_overflows(T, V(typemax(T) - 1), true)
-                @test !FixedPointDecimals._check_overflows(T, V(typemax(T) - 1), false)
-
-                @test !FixedPointDecimals._check_overflows(T, V(typemax(T)), true)
-                @test !FixedPointDecimals._check_overflows(T, V(typemax(T)), false)
-            end
-
-            if V === BigInt || typemax(T) < typemax(V)
-                @test !FixedPointDecimals._check_overflows(T, V(V(typemax(T)) + 1), true)
-                @test FixedPointDecimals._check_overflows(T, V(V(typemax(T)) + 1), false)
-
-                @test FixedPointDecimals._check_overflows(T, V(V(typemax(T)) + 2), true)
-                @test FixedPointDecimals._check_overflows(T, V(V(typemax(T)) + 2), false)
-            end
-
-            if V !== BigInt && typemax(T) > typemax(V)
-                @test !FixedPointDecimals._check_overflows(T, typemax(V), true)
-                @test !FixedPointDecimals._check_overflows(T, typemax(V), false)
-            end
-        end
-    end
-
-    @testset "$T" for T in UnsignedIntegerTypes
-        @testset "$V" for V in (UInt64, UInt128, BigInt)
-            @test !FixedPointDecimals._check_overflows(T, V(0), true)
-            @test !FixedPointDecimals._check_overflows(T, V(0), false)
-            @test !FixedPointDecimals._check_overflows(T, V(1), false)
-
-            if V === BigInt
-                @test FixedPointDecimals._check_overflows(T, V(1), true)
-                @test FixedPointDecimals._check_overflows(T, V(typemax(T) - 1), true)
-                @test FixedPointDecimals._check_overflows(T, V(typemax(T)), true)
-                @test FixedPointDecimals._check_overflows(T, V(V(typemax(T)) + 1), true)
-                @test FixedPointDecimals._check_overflows(T, V(V(typemax(T)) + 2), true)
-            end
-
-            if V === BigInt || typemax(T) == typemax(V)
-                @test !FixedPointDecimals._check_overflows(T, V(typemax(T) - 1), false)
-                @test !FixedPointDecimals._check_overflows(T, V(typemax(T)), false)
-            end
-
-            if V === BigInt || typemax(T) < typemax(V)
-                @test FixedPointDecimals._check_overflows(T, V(V(typemax(T)) + 1), false)
-                @test FixedPointDecimals._check_overflows(T, V(V(typemax(T)) + 2), false)
-            end
-
-            if V !== BigInt && typemax(T) > typemax(V)
-                @test !FixedPointDecimals._check_overflows(T, typemax(V), false)
-            end
-        end
-    end
-end
-
 T = Int64
 f = 8
-@testset "xparse" begin
+@testset "Parsers.tryparse" begin
 @testset "1.0" begin
     @testset "$T" for T in IntegerTypes
         @testset "$f" for f in 0:(_maxintdigits(T) - 1)
@@ -344,7 +267,7 @@ end
                 "",
                 "a",
                 ";",
-                # ".",
+                ".",
                 "e",
                 "E",
                 ",0",
@@ -354,8 +277,8 @@ end
                 "10,.",
                 "e0",
                 "E0",
-                # ".e0",
-                # ".E0",
+                ".e0",
+                ".E0",
                 "10ea",
                 "10,e0",
             ]
@@ -365,9 +288,9 @@ end
             test_decimal_parser(T, 1, "-" * base_str, ok=false)
         end
     end
-    @test Parsers.invalid(Parsers.xparse(FixedDecimal{T,f}, "10.0,0"; groupmark=GROUP, delim=DELIM, decimal=DECIM, quoted=true).code)
-    @test Parsers.invalid(Parsers.xparse(FixedDecimal{T,f}, "10.0e1.0"; groupmark=GROUP, delim=DELIM, decimal=DECIM, quoted=true).code)
-    @test Parsers.invalid(Parsers.xparse(FixedDecimal{T,f}, "10,e0"; groupmark=GROUP, delim=DELIM, decimal=DECIM, quoted=true).code)
+    @test isnothing(Parsers.tryparse(FixedDecimal{T,f}, "10.0,0"; groupmark=GROUP, decimal=DECIM))
+    @test isnothing(Parsers.tryparse(FixedDecimal{T,f}, "10.0e1.0"; groupmark=GROUP, decimal=DECIM))
+    @test isnothing(Parsers.tryparse(FixedDecimal{T,f}, "10,e0"; groupmark=GROUP, decimal=DECIM))
 end
 
 
@@ -431,20 +354,20 @@ end
         test_decimal_parser(T, 2, "1,27.0e-2", expect=127)
     end
 
-    @test Parsers.xparse(FixedDecimal{Int,8}, "2", groupmark=',', delim=',', decimal='.', quoted=true).val == FixedDecimal{Int,8}(2)
-    @test Parsers.xparse(FixedDecimal{Int,4}, "\" 2000.0 \"", groupmark=',', delim=',', decimal='.', quoted=true).val == FixedDecimal{Int,4}(2000)
-    @test Parsers.xparse(FixedDecimal{Int,4}, "\" 2,000.0 \"", groupmark=',', delim=',', decimal='.', quoted=true).val == FixedDecimal{Int,4}(2000)
+    @test Parsers.tryparse(FixedDecimal{Int,8}, "2", groupmark=',', decimal='.') == FixedDecimal{Int,8}(2)
+    @test Parsers.tryparse(FixedDecimal{Int,4}, " 2000.0 ", groupmark=',', decimal='.') == FixedDecimal{Int,4}(2000)
+    @test Parsers.tryparse(FixedDecimal{Int,4}, " 2,000.0 ", groupmark=',', decimal='.') == FixedDecimal{Int,4}(2000)
 end
 
 @testset "misc options" begin
-    for (dec, grp, del) in (('.', "", ','), (',', " ", ';'), ('.', ",", '|'))
-        test_options = Parsers.Options(groupmark=isempty(grp) ? nothing : only(grp), decimal=dec, delim=del, quoted=true, rounding=RoundNearest)
+    for (dec, grp) in (('.', ""), (',', " "), ('.', ","))
+        test_options = (groupmark=isempty(grp) ? nothing : only(grp), decimal=dec, rounding=RoundNearest)
         for T in IntegerTypes
             for test_case in [
                     "123$(dec)123",
-                    "123$(dec)123$(del)",
+                    "123$(dec)123 ",
                     "1$(grp)2$(grp)3$(dec)123",
-                    "1$(grp)2$(grp)3$(grp)1$(grp)2$(grp)3e-3$(del)",
+                    "1$(grp)2$(grp)3$(grp)1$(grp)2$(grp)3e-3\t",
                 ]
                 test_decimal_parser(T, 0, test_case, expect=123, options=test_options)
                 test_decimal_parser(T, 0, "+" * test_case, expect=123, options=test_options)
@@ -455,7 +378,61 @@ end
         end
     end
 end
-end # @testset "xparse"
+end # @testset "Parsers.tryparse"
+
+@testset "Parsers API" begin
+    @test Parsers.parse(FD4, "1,234.5"; groupmark=',') == FD4(1234.5)
+    @test Parsers.parse(FD4, "1.234,5"; groupmark='.', decimal=',') == FD4(1234.5)
+    @test Parsers.parse(FD4, "1 234,5"; groupmark=' ', decimal=',') == FD4(1234.5)
+    @test Parsers.parse(FD2, "0.125"; rounding=RoundToZero) == FD2(0.12)
+    @test Parsers.parse(FD2, codeunits("1.5")) == FD2(1.5)
+    @test Parsers.tryparse(FD2, Vector{UInt8}("1.5")) == FD2(1.5)
+    @test Parsers.tryparse(FD2, SubString("x1.5x", 2, 4)) == FD2(1.5)
+    @test isnothing(Parsers.tryparse(FD2, "0.125"; rounding=RoundThrows))
+
+    buf = Vector{UInt8}("1.5,abc,-2.25")
+    @test Parsers.parse(FD2, buf, 1, 3) == FD2(1.5)
+    @test Parsers.tryparse(FD2, buf, 9, 13) == FD2(-2.25)
+    @test isnothing(Parsers.tryparse(FD2, buf, 5, 7))
+    @test isnothing(Parsers.tryparse(FD2, buf, 4, 3))
+    @test_throws BoundsError Parsers.tryparse(FD2, buf, 9, 14)
+    @test_throws BoundsError Parsers.parse(FD2, buf, 0, 3)
+
+    @test_throws ArgumentError Parsers.parse(FD2, buf, 5, 7)
+    @test_throws OverflowError Parsers.parse(FixedDecimal{Int8,1}, "13")
+    @test_throws InexactError Parsers.parse(FD2, "0.125"; rounding=RoundThrows)
+
+    @test_throws ArgumentError Parsers.tryparse(FD2, "1.5"; rounding=RoundUp)
+    @test_throws ArgumentError Parsers.tryparse(FD2, "1.5"; groupmark='.')
+    @test_throws ArgumentError Parsers.tryparse(FD2, "1.5"; decimal='1')
+    @test_throws ArgumentError Parsers.tryparse(FD2, "1.5"; groupmark='e')
+    @test_throws ArgumentError Parsers.tryparse(FD2, "1.5"; decimal='·')
+end
+
+@testset "regressions" begin
+    # Inputs with as many digits as the storage type used to silently wrap around
+    @test isnothing(tryparse(FixedDecimal{Int8,1}, "61"))
+    @test_throws OverflowError parse(FixedDecimal{Int8,1}, "61")
+    @test_throws OverflowError parse(FixedDecimal{UInt64,0}, "18446744073709551616")
+    @test parse(FixedDecimal{UInt64,0}, "18446744073709551615") == typemax(FixedDecimal{UInt64,0})
+    # Huge exponents
+    @test parse(FD2, "0e99999999999999999999") == FD2(0)
+    @test parse(FD2, "1e-99999999999999999999") == FD2(0)
+    @test_throws InexactError parse(FD2, "1e-99999999999999999999", RoundThrows)
+    @test_throws OverflowError parse(FD2, "1e99999999999999999999")
+    # A mantissa needs at least one digit
+    @test isnothing(tryparse(FD2, ".e0"))
+    @test isnothing(tryparse(FD2, "-."))
+    # Surrounding ASCII whitespace is ignored
+    @test parse(FD2, "\t1.5\n") == FD2(1.5)
+    @test isnothing(tryparse(FD2, "1 .5"))
+    # Negative values only parse as unsigned if they round to zero
+    @test tryparse(FixedDecimal{UInt8,2}, "-0.004") == FixedDecimal{UInt8,2}(0)
+    @test isnothing(tryparse(FixedDecimal{UInt8,2}, "-0.006"))
+    @test tryparse(FixedDecimal{UInt8,2}, "-0.006", RoundToZero) == FixedDecimal{UInt8,2}(0)
+    @test_throws ArgumentError parse(FixedDecimal{UInt8,2}, "-1")
+    @test_throws ArgumentError parse(FixedDecimal{UInt8,2}, "-1e99")
+end
 
 @testset "parse" begin
     # Note: the underscore used in the reinterpreted integer is used to indicate the decimal
